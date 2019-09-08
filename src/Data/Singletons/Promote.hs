@@ -38,8 +38,10 @@ import Control.Arrow (second)
 import Control.Monad
 import Control.Monad.Trans.Maybe
 import Control.Monad.Writer
+import Data.List (unzip4)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict ( Map )
+import Data.Maybe
 import qualified GHC.LanguageExtensions.Type as LangExt
 
 -- | Generate promoted definitions from a type that is already defined.
@@ -227,12 +229,13 @@ promoteDecs raw_decls = do
         , pd_ty_syn_decs             = ty_syns
         , pd_open_type_family_decs   = o_tyfams
         , pd_closed_type_family_decs = c_tyfams
+        , pd_standalone_kind_sigs    = saks
         , pd_derived_eq_decs         = derived_eq_decs } <- partitionDecs decls
 
   defunTopLevelTypeDecls ty_syns c_tyfams o_tyfams
     -- promoteLetDecs returns LetBinds, which we don't need at top level
   _ <- promoteLetDecs noPrefix let_decs
-  mapM_ promoteClassDec classes
+  mapM_ (promoteClassDec saks) classes
   let orig_meth_sigs = foldMap (lde_types . cd_lde) classes
       cls_tvbs_map   = Map.fromList $ map (\cd -> (cd_name cd, cd_tvbs cd)) classes
   mapM_ (promoteInstanceDec orig_meth_sigs cls_tvbs_map) insts
@@ -284,22 +287,23 @@ promoteDataDec (DataDecl _name _tvbs ctors) = do
   ctorSyms <- buildDefunSymsDataD ctors
   emitDecs ctorSyms
 
-promoteClassDec :: UClassDecl
-                -> PrM AClassDecl
-promoteClassDec decl@(ClassDecl { cd_name = cls_name
-                                , cd_tvbs = tvbs
-                                , cd_fds  = fundeps
-                                , cd_atfs = atfs
-                                , cd_lde  = lde@LetDecEnv
-                                    { lde_defns = defaults
-                                    , lde_types = meth_sigs
-                                    , lde_infix = infix_decls } }) = do
+promoteClassDec :: Map Name DKind -- Standalone kind signatures
+                -> UClassDecl -> PrM AClassDecl
+promoteClassDec saks decl@(ClassDecl { cd_name = cls_name
+                                     , cd_tvbs = tvbs
+                                     , cd_fds  = fundeps
+                                     , cd_atfs = atfs
+                                     , cd_lde  = lde@LetDecEnv
+                                         { lde_defns = defaults
+                                         , lde_types = meth_sigs
+                                         , lde_infix = infix_decls } }) = do
   let pClsName = promoteClassName cls_name
   forallBind cls_kvs_to_bind $ do
     let meth_sigs_list = OMap.assocs meth_sigs
         meth_names     = map fst meth_sigs_list
         defaults_list  = OMap.assocs defaults
         defaults_names = map fst defaults_list
+    mb_cls_sak <- dsReifyTypeWith saks cls_name
     sig_decs <- mapM (uncurry promote_sig) meth_sigs_list
     (default_decs, ann_rhss, prom_rhss)
       <- mapAndUnzip3M (promoteMethod DefaultMethods meth_sigs) defaults_list
@@ -311,7 +315,8 @@ promoteClassDec decl@(ClassDecl { cd_name = cls_name
     -- no need to do anything to the fundeps. They work as is!
     let pro_cls_dec = DClassD [] pClsName tvbs fundeps
                               (sig_decs ++ default_decs ++ infix_decls')
-    emitDecs $ pro_cls_dec:cls_infix_decls
+        mb_pro_cls_sak = fmap (DKiSigD pClsName) mb_cls_sak
+    emitDecs $ maybeToList mb_pro_cls_sak ++ pro_cls_dec:cls_infix_decls
     let defaults_list'   = zip defaults_names ann_rhss
         proms            = zip defaults_names prom_rhss
         cls_kvs_to_bind' = cls_kvs_to_bind <$ meth_sigs
@@ -464,10 +469,10 @@ promoteMethod meth_sort orig_sigs_map (meth_name, meth_rhs) = do
       -- strictly necessary, as kind inference can figure them out just as well.
       family_args = map DVarT meth_arg_tvs
   helperName <- newUniqueName helperNameBase
-  (pro_dec, defun_decs, ann_rhs)
+  (pro_dec, m_sak_dec, defun_decs, ann_rhs)
     <- promoteLetDecRHS (ClassMethodRHS meth_arg_kis meth_res_ki) OMap.empty OMap.empty
                         noPrefix helperName meth_rhs
-  emitDecs (pro_dec:defun_decs)
+  emitDecs (maybeToList m_sak_dec ++ pro_dec:defun_decs)
   return ( DTySynInstD
              (DTySynEqn Nothing
                         (foldType (DConT proName) family_args)
@@ -567,13 +572,13 @@ promoteLetDecEnv prefixes (LetDecEnv { lde_defns = value_env
 
     -- promote all the declarations, producing annotated declarations
   let (names, rhss) = unzip $ OMap.assocs value_env
-  (pro_decs, defun_decss, ann_rhss)
-    <- fmap unzip3 $
+  (pro_decs, m_sak_decs, defun_decss, ann_rhss)
+    <- fmap unzip4 $
        zipWithM (promoteLetDecRHS LetBindingRHS type_env fix_env prefixes) names rhss
 
   emitDecs $ concat defun_decss
   bound_kvs <- allBoundKindVars
-  let decs = pro_decs ++ infix_decls
+  let decs = catMaybes m_sak_decs ++ pro_decs ++ infix_decls
 
     -- build the ALetDecEnv
   let let_dec_env' = LetDecEnv { lde_defns     = OMap.fromList $ zip names ann_rhss
@@ -659,6 +664,7 @@ promoteLetDecRHS :: LetDecRHSSort
                  -> Name                 -- name of the thing being promoted
                  -> ULetDecRHS           -- body of the thing
                  -> PrM ( DDec          -- "type family"
+                        , Maybe DDec    -- standalone kind signature for type family
                         , [DDec]        -- defunctionalization
                         , ALetDecRHS )  -- annotated RHS
 promoteLetDecRHS rhs_sort type_env fix_env prefixes name (UValue exp) = do
@@ -681,10 +687,16 @@ promoteLetDecRHS rhs_sort type_env fix_env prefixes name (UValue exp) = do
       let proName = promoteValNameLhsPrefix prefixes name
           m_fixity = OMap.lookup name fix_env
           tvbs = map DPlainTV all_locals
+          m_sak_dec = case rhs_sort of
+                        ClassMethodRHS{}    -> Nothing
+                        LetBindingRHS
+                          | null all_locals -> fmap (DKiSigD proName) res_kind
+                          | otherwise       -> Nothing
       defuns <- defunctionalize proName m_fixity tvbs res_kind
       return ( DClosedTypeFamilyD
                  (DTypeFamilyHead proName tvbs (maybeKindToResultSig res_kind) Nothing)
                  [DTySynEqn Nothing (foldType (DConT proName) $ map DVarT all_locals) exp']
+             , m_sak_dec
              , defuns
              , AValue (foldType (DConT proName) (map DVarT all_locals))
                       num_arrows ann_exp )
@@ -697,9 +709,9 @@ promoteLetDecRHS rhs_sort type_env fix_env prefixes name (UValue exp) = do
 
 promoteLetDecRHS rhs_sort type_env fix_env prefixes name (UFunction clauses) = do
   numArgs <- count_args clauses
-  (m_argKs, m_resK, ty_num_args) <- case rhs_sort of
+  (m_sak, m_argKs, m_resK, ty_num_args) <- case rhs_sort of
     ClassMethodRHS arg_kis res_ki
-      -> return (map Just arg_kis, Just res_ki, length arg_kis)
+      -> return (Nothing, map Just arg_kis, Just res_ki, length arg_kis)
     LetBindingRHS
       |  Just ty <- OMap.lookup name type_env
       -> do
@@ -707,11 +719,12 @@ promoteLetDecRHS rhs_sort type_env fix_env prefixes name (UFunction clauses) = d
       -- avoid this behavior. Note the use of ravelTyFun in resultK
       -- to make the return kind work out
       (argKs, resultK) <- promoteUnraveled ty
+      let sak = ravel argKs resultK
       -- invariant: count_args ty == length argKs
-      return (map Just argKs, Just resultK, length argKs)
+      return (Just sak, map Just argKs, Just resultK, length argKs)
 
       |  otherwise
-      -> return (replicate numArgs Nothing, Nothing, numArgs)
+      -> return (Nothing, replicate numArgs Nothing, Nothing, numArgs)
   let proName  = promoteValNameLhsPrefix prefixes name
       m_fixity = OMap.lookup name fix_env
   all_locals <- allLocals
@@ -724,10 +737,16 @@ promoteLetDecRHS rhs_sort type_env fix_env prefixes name (UFunction clauses) = d
   let lde_kvs_to_bind = foldMap (foldMap fvDType) m_argKs <> foldMap fvDType m_resK
   (eqns, ann_clauses) <- forallBind lde_kvs_to_bind $
                          mapAndUnzipM (promoteClause proName) expClauses
+  let m_sak_dec = case rhs_sort of
+                    ClassMethodRHS{}    -> Nothing
+                    LetBindingRHS
+                      | null all_locals -> fmap (DKiSigD proName) m_sak
+                      | otherwise       -> Nothing
   prom_fun <- lookupVarE name
   return ( DClosedTypeFamilyD
              (DTypeFamilyHead proName all_args (maybeKindToResultSig m_resK) Nothing)
              eqns
+         , m_sak_dec
          , defun_decs
          , AFunction prom_fun ty_num_args ann_clauses )
 

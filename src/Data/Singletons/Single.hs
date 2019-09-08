@@ -306,13 +306,14 @@ singTopLevelDecs locals raw_decls = withLocalDeclarations locals $ do
         , pd_open_type_family_decs   = o_tyfams
         , pd_closed_type_family_decs = c_tyfams
         , pd_derived_eq_decs         = derivedEqDecs
+        , pd_standalone_kind_sigs    = saks
         , pd_derived_show_decs       = derivedShowDecs } <- partitionDecs decls
 
   ((letDecEnv, classes', insts'), promDecls) <- promoteM locals $ do
     defunTopLevelTypeDecls ty_syns c_tyfams o_tyfams
     promoteDataDecs datas
     (_, letDecEnv) <- promoteLetDecs noPrefix letDecls
-    classes' <- mapM promoteClassDec classes
+    classes' <- mapM (promoteClassDec saks) classes
     let meth_sigs    = foldMap (lde_types . cd_lde) classes
         cls_tvbs_map = Map.fromList $ map (\cd -> (cd_name cd, cd_tvbs cd)) classes
     insts' <- mapM (promoteInstanceDec meth_sigs cls_tvbs_map) insts
@@ -326,7 +327,7 @@ singTopLevelDecs locals raw_decls = withLocalDeclarations locals $ do
                             <- bindLets letBinds $
                                singLetDecEnv letDecEnv $ do
                                  newDataDecls <- concatMapM singDataD datas
-                                 newClassDecls <- mapM singClassD classes'
+                                 newClassDecls <- mapM (singClassD saks) classes'
                                  newInstDecls <- mapM singInstD insts'
                                  newDerivedEqDecs <- concatMapM singDerivedEqDecs derivedEqDecs
                                  newDerivedShowDecs <- concatMapM singDerivedShowDecs derivedShowDecs
@@ -364,22 +365,25 @@ buildMethLets (ClassDecl { cd_lde = LetDecEnv { lde_types = meth_sigs } }) =
       , wrapSingFun (countArgs meth_ty) (promoteValRhs meth_name)
                                         (DVarE $ singValName meth_name) )
 
-singClassD :: AClassDecl -> SgM DDec
-singClassD (ClassDecl { cd_cxt  = cls_cxt
-                      , cd_name = cls_name
-                      , cd_tvbs = cls_tvbs
-                      , cd_fds  = cls_fundeps
-                      , cd_lde  = LetDecEnv { lde_defns     = default_defns
-                                            , lde_types     = meth_sigs
-                                            , lde_infix     = fixities
-                                            , lde_proms     = promoted_defaults
-                                            , lde_bound_kvs = meth_bound_kvs } }) =
+singClassD :: Map Name DKind -- Standalone kind signatures
+           -> AClassDecl -> SgM DDec
+singClassD saks (ClassDecl { cd_cxt  = cls_cxt
+                           , cd_name = cls_name
+                           , cd_tvbs = cls_tvbs
+                           , cd_fds  = cls_fundeps
+                           , cd_lde  = LetDecEnv { lde_defns     = default_defns
+                                                 , lde_types     = meth_sigs
+                                                 , lde_infix     = fixities
+                                                 , lde_proms     = promoted_defaults
+                                                 , lde_bound_kvs = meth_bound_kvs } }) =
   bindContext [foldTypeTvbs (DConT cls_name) cls_tvbs] $ do
+    mb_cls_sak <- dsReifyTypeWith saks cls_name
+    let mb_sing_cls_sak = fmap (DKiSigD sing_cls_name) mb_cls_sak
     cls_infix_decls <- singReifiedInfixDecls $ cls_name:meth_names
     (sing_sigs, _, tyvar_names, cxts, res_kis, singIDefunss)
       <- unzip6 <$> zipWithM (singTySig no_meth_defns meth_sigs meth_bound_kvs)
                              meth_names (map promoteValRhs meth_names)
-    emitDecs $ cls_infix_decls ++ concat singIDefunss
+    emitDecs $ maybeToList mb_sing_cls_sak ++ cls_infix_decls ++ concat singIDefunss
     let default_sigs = catMaybes $
                        zipWith4 mk_default_sig meth_names sing_sigs tyvar_names res_kis
         res_ki_map   = Map.fromList (zip meth_names
@@ -391,13 +395,14 @@ singClassD (ClassDecl { cd_cxt  = cls_cxt
     fixities' <- mapMaybeM (uncurry singInfixDecl) $ OMap.assocs fixities
     cls_cxt' <- mapM singPred cls_cxt
     return $ DClassD cls_cxt'
-                     (singClassName cls_name)
+                     sing_cls_name
                      cls_tvbs
                      cls_fundeps   -- they are fine without modification
                      (map DLetDec (sing_sigs ++ sing_meths ++ fixities') ++ default_sigs)
   where
     no_meth_defns = error "Internal error: can't find declared method type"
     always_sig    = error "Internal error: no signature for default method"
+    sing_cls_name = singClassName cls_name
     meth_names    = map fst $ OMap.assocs meth_sigs
 
     mk_default_sig meth_name (DSigD s_name sty) bound_kvs (Just res_ki) =

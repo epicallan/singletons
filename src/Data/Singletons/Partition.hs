@@ -48,17 +48,19 @@ data PartitionedDecs =
         , pd_ty_syn_decs :: [TySynDecl]
         , pd_open_type_family_decs :: [OpenTypeFamilyDecl]
         , pd_closed_type_family_decs :: [ClosedTypeFamilyDecl]
+        , pd_standalone_kind_sigs :: Map Name DKind
         , pd_derived_eq_decs :: [DerivedEqDecl]
         , pd_derived_show_decs :: [DerivedShowDecl]
         }
 
 instance Semigroup PartitionedDecs where
-  PDecs a1 b1 c1 d1 e1 f1 g1 h1 i1 <> PDecs a2 b2 c2 d2 e2 f2 g2 h2 i2 =
+  PDecs a1 b1 c1 d1 e1 f1 g1 h1 i1 j1 <> PDecs a2 b2 c2 d2 e2 f2 g2 h2 i2 j2 =
     PDecs (a1 <> a2) (b1 <> b2) (c1 <> c2) (d1 <> d2) (e1 <> e2) (f1 <> f2)
-          (g1 <> g2) (h1 <> h2) (i1 <> i2)
+          (g1 <> g2) (h1 <> h2) (i1 <> i2) (j1 <> j2)
 
 instance Monoid PartitionedDecs where
-  mempty = PDecs [] [] [] [] [] [] [] [] []
+  mempty = PDecs mempty mempty mempty mempty mempty
+                 mempty mempty mempty mempty mempty
   mappend = (<>)
 
 -- | Split up a @[DDec]@ into its pieces, extracting 'Ord' instances
@@ -150,6 +152,9 @@ partitionDec (DStandaloneDerivD mb_strat _ ctxt ty) =
                        ++ show data_ty
               _ -> fail $ "Cannot find " ++ show data_ty
     _ -> return mempty
+-- TODO RGS: Comments
+partitionDec (DKiSigD n ki) =
+  pure $ mempty { pd_standalone_kind_sigs = Map.singleton n ki }
 partitionDec dec =
   fail $ "Declaration cannot be promoted: " ++ pprint (decToTH dec)
 

@@ -76,6 +76,7 @@ instance Quasi SgM where
   qAddForeignFilePath = liftSgM `comp2` qAddForeignFilePath
   qAddTempFile        = liftSgM `comp1` qAddTempFile
   qAddCorePlugin      = liftSgM `comp1` qAddCorePlugin
+  qReifyType          = liftSgM `comp1` qReifyType
 
   qRecover (SgM handler) (SgM body) = do
     env <- ask

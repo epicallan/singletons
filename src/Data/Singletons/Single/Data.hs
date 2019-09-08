@@ -54,6 +54,7 @@ singDataD (DataDecl name tvbs ctors) = do
         DTySynInstD $ DTySynEqn Nothing
                                 (DConT singFamilyName `DAppKindT` k)
                                 (DConT singDataName)
+      -- TODO RGS: Do something with SAKS here
       kindedSingTy = DForallT ForallInvis (map DPlainTV tvbNames) $
                      DArrowT `DAppT` k `DAppT` DConT typeKindName
 

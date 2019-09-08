@@ -502,6 +502,7 @@ instance (Quasi q, Monoid m) => Quasi (QWithAux m q) where
   qAddForeignFilePath = lift `comp2` qAddForeignFilePath
   qAddTempFile        = lift `comp1` qAddTempFile
   qAddCorePlugin      = lift `comp1` qAddCorePlugin
+  qReifyType          = lift `comp1` qReifyType
 
   qRecover exp handler = do
     (result, aux) <- lift $ qRecover (evalForPair exp) (evalForPair handler)
@@ -550,6 +551,13 @@ dsReifyTypeNameInfo ty_name = do
   case mb_name of
     Just n  -> dsReify n
     Nothing -> pure Nothing
+
+dsReifyTypeWith :: DsMonad q
+                => Map Name DType -> Name -> q (Maybe DType)
+dsReifyTypeWith type_map n =
+  case Map.lookup n type_map of
+    m_ty@Just{} -> pure m_ty
+    Nothing     -> dsReifyType n
 
 -- lift concatMap into a monad
 -- could this be more efficient?
